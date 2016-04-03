@@ -15,6 +15,12 @@
 // version 1.10 (20150320) Added asynchronous group deleting
 // version 1.11 (20150517) Added comments for methods. Fixied issue with Initialize(), GetAssignmentItems(), etc.
 // version 1.12 (20150526) Added ability to grade an assignments (Alexander Yasko) and IsIdle() method (aeperepelitsyn)
+// version 1.13 (20150529) Added possibility to set first name and last name for specified user by its id
+// version 1.14 (20150601) Fixed issue with User tab for renaming users (Alexander Yasko) and with reloading of student information (aeperepelitsyn)
+// version 1.15 (20160123) Fixed issue with Draft Assignments, Added method ReadWorksitesAsync (aeperepelitsyn)
+// version 1.16 (20160125) Added ability to read all worksites, fixed issue with few worksites with the same name (moskalenkoBV)
+// version 1.17 (20160322) Added event WorksitesReady for providing of ability to handle end of worksites parsing (moskalenkoBV)
+// version 1.18 (20160324) Added events WorksiteSelected, AssignmentItemsReady, StudentsInformationReady (moskalenkoBV)
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -110,10 +116,13 @@ namespace SakaiParser
     public enum WebBrowserTask
     {
         Idle,
+        Busy,
         LogIn,
         GetMembershipLink,
         ParseWorksites,
+        ParseSelectedWorksite,
         GoToAssignments,
+        GoToAdministrationWorkspaceUsersTab,
         ParseAssignments,
         LoadStudents,
         ReloadStudents,
@@ -127,6 +136,18 @@ namespace SakaiParser
         AddNewGroup,
         SetNewFirstNameAndLastName
     }
+
+    public enum SPExceptions
+    {
+        UnableToFindMembership,
+        UnableToFindLinkToUsersTab,
+        WorksiteNameAlreadyExist
+    }                   
+    public delegate void DelegateException(SPExceptions exception, String message);
+    public delegate void DelegateWorksitesReady(String[] worksites);
+    public delegate void DelegateWorksiteSelected(String worksiteName);
+    public delegate void DelegateAssignmentItemsReady(String[] assignmentTitles);
+    public delegate void DelegateStudentsInformationReady(String[] studentIDs); 
 
     class SakaiParser285
     {
@@ -148,10 +169,11 @@ namespace SakaiParser
         string linkToSiteEditor;
         string linkToManageGroupsSection;
         string linkToCreateNewGroupSection;
-        string linkToAssignments;
+
+        private string linkToAssignments; // Link to Assignments page
 
         private string gradeStudentID;
-        private int studentmark;
+        private String studentmark;
 
         int addingStudentsCount;
 
@@ -174,6 +196,67 @@ namespace SakaiParser
 
         bool assignmentsParsed;
 
+        public event DelegateException SPException;
+        private void SPExceptionProvider(SPExceptions exception)
+        {
+            String message;
+            switch(exception)
+            {
+                case SPExceptions.UnableToFindMembership:
+                    message = "Unable to find Membership link"; break;
+                case SPExceptions.UnableToFindLinkToUsersTab:
+                    message = "Unable to find link to Users Tab"; break;
+                case SPExceptions.WorksiteNameAlreadyExist:
+                    message = "Worksite name already exist"; break;
+                default:
+                    message = "Unknown exception"; break;
+            }
+            if (SPException != null)
+            {
+                SPException(exception, message);
+            }
+            else
+            {
+                throw new Exception(message);
+            }
+        }
+
+        public event DelegateWorksitesReady WorksitesReady;
+        private void WorksitesReadyProvider()
+        {
+            if (WorksitesReady != null)
+            {
+                WorksitesReady(GetWorksites());
+            }
+        }
+
+        public event DelegateWorksiteSelected WorksiteSelected;
+        private void WorksiteSelectedProvider()
+        {
+            if (WorksiteSelected != null)
+            {
+                WorksiteSelected(worksiteName);
+            }
+        }
+
+        public event DelegateAssignmentItemsReady AssignmentItemsReady;
+        private void AssignmentItemsReadyProvider()
+        {
+            if (AssignmentItemsReady != null)
+            {
+                AssignmentItemsReady(GetAssignmentItemNames());
+            }
+        }
+
+        public event DelegateStudentsInformationReady StudentsInformationReady;
+        private void StudentsInformationReadyProvider()
+        {
+            if (StudentsInformationReady != null)
+            {
+                StudentsInformationReady(GetStudentIDs());
+            }
+        }
+        
         void ResetFields()
         {
             dctStudentInfos.Clear();
@@ -192,9 +275,10 @@ namespace SakaiParser
             dctStudentInfos = new Dictionary<string, StudentInfo>();
             worksiteName = "";
             linkToMembership = "";
+            SPException = null;
             this.webBrowser = webBrowser;
             webBrowser.DocumentCompleted += webBrowser_DocumentCompleted;
-
+            
 
             confirmDeletingVoid = new ConfirmDeleting(InvokeGroupDeleting);
         }
@@ -229,15 +313,28 @@ namespace SakaiParser
         }
 
         /// <summary>
+        /// Function read worksite names for current authorized user.
+        /// </summary>
+        public void ReadWorksitesAsync()
+        {
+            bool renavigate = (webBrowserTask == WebBrowserTask.Idle);
+            webBrowserTask = WebBrowserTask.GetMembershipLink;
+            if (renavigate)
+            {
+                webBrowser.Navigate(webBrowser.Url);
+            }
+        }
+
+        /// <summary>
         /// Selects the worksite name.
         /// The name should be existing.
         /// </summary>
         /// <param name="worksiteName">The name of the worksite</param>
-        public void SetWorksiteName(string worksiteName)
+        public void SelectWorksite(string worksiteName)
         {
             this.worksiteName = worksiteName;
             ResetFields();
-            webBrowserTask = WebBrowserTask.GoToAssignments;
+            webBrowserTask = WebBrowserTask.ParseSelectedWorksite;
             webBrowser.Navigate(dctWorksites[worksiteName]);
         }
 
@@ -245,6 +342,7 @@ namespace SakaiParser
         {
             if (!confidentLoad)
             {
+                if (e == null) return;
                 if (e.Url != webBrowser.Url) return; // If we have not reached destination URL
                 if (String.IsNullOrWhiteSpace(webBrowser.DocumentTitle)) return; // Waiting for page
             }
@@ -255,57 +353,101 @@ namespace SakaiParser
 
             switch (webBrowserTask)
             {
+                case WebBrowserTask.Busy:
+                    {
+                        webBrowserTask = WebBrowserTask.Idle;
+                        break;
+                    }
                 case WebBrowserTask.LogIn:
                     LogIn();
                     break;
                 case WebBrowserTask.ParseWorksites:
-
-                    dctWorksites.Clear();
-
                     HtmlElement worksiteTable = webBrowser.Document.Window.Frames[0].Document.GetElementById("currentSites");
                     HtmlElementCollection tableTDs = worksiteTable.GetElementsByTagName("td");
-                    foreach(HtmlElement worksiteTD in tableTDs)
+                    foreach (HtmlElement worksiteTD in tableTDs)
                     {
-                        if(worksiteTD.GetAttribute("headers") == "worksite")
+                        if (worksiteTD.GetAttribute("headers") == "worksite")
                         {
                             HtmlElement linkToWorksite = worksiteTD.GetElementsByTagName("a")[0];
                             string sLink = linkToWorksite.GetAttribute("href");
-
-                            dctWorksites.Add(worksiteTD.InnerText, sLink);
+                            if (dctWorksites.ContainsKey(worksiteTD.InnerText))
+                            {
+                               //SPExceptionProvider(SPExceptions.WorksiteNameAlreadyExist);
+                            }
+                            else
+                            {
+                                dctWorksites.Add(worksiteTD.InnerText, sLink);
+                            }
                         }
                     }
-
+                    //Alternative implementation:
+                    //HtmlElement worksiteTables = webBrowser.Document.Window.Frames[0].Document.GetElementById("currentSites");
+                    //HtmlElementCollection curSites = worksiteTables.GetElementsByTagName("a");
+                    //string sLink = "";
+                    //foreach (HtmlElement workSiteName in curSites)
+                    //{
+                    //    if (workSiteName.GetAttribute("target") == "_top")
+                    //    {
+                    //        sLink = workSiteName.GetAttribute("href");
+                    //        dctWorksites.Add(workSiteName.InnerText,sLink);
+                    //    }
+                    //}
                     // Worksites in dctWorksites
-
-                    if (!String.IsNullOrWhiteSpace(worksiteName))
+                    bool nextPageAvailable = false;
+                    HtmlElementCollection buttonForms = webBrowser.Document.Window.Frames[0].Document.GetElementsByTagName("input");
+                    foreach (HtmlElement worksiteTD in buttonForms)
                     {
-                        webBrowserTask = WebBrowserTask.GoToAssignments;
-                        webBrowser.Navigate(dctWorksites[worksiteName]);
+                        if (worksiteTD.GetAttribute("name") == "eventSubmit_doList_next")
+                        {
+                            if (worksiteTD.GetAttribute("disabled") == "False")
+                            {
+                                nextPageAvailable = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (nextPageAvailable)
+                    {
+                        webBrowserTask = WebBrowserTask.ParseWorksites;
+                        webBrowser.Navigate("javascript:window.frames[0].document.forms[4].elements[0].click()");
+                        Task asyncTask = new Task(() =>
+                        {
+                            Thread.Sleep(500);
+                        });
+
+                        asyncTask.ContinueWith((a) =>
+                        {
+                            webBrowser.Navigate(webBrowser.Url);
+                        }, TaskScheduler.FromCurrentSynchronizationContext());
+
+                        asyncTask.Start();
                     }
                     else
                     {
                         webBrowserTask = WebBrowserTask.Idle;
+                        WorksitesReadyProvider();
                     }
-
                     break;
                 case WebBrowserTask.GetMembershipLink:
 
                     HtmlElementCollection linksCollection = webBrowser.Document.GetElementsByTagName("a");
-                    foreach(HtmlElement link in linksCollection)
+                    foreach (HtmlElement link in linksCollection)
                         if (link.GetAttribute("className") == "icon-sakai-membership")
                             linkToMembership = link.GetAttribute("href");
-                    if (linkToMembership == "") throw new Exception("Unable to find Membership link");
-
+                    if (linkToMembership == "")
+                    {
+                        SPExceptionProvider(SPExceptions.UnableToFindMembership);
+                    }
                     webBrowserTask = WebBrowserTask.ParseWorksites;
+                    dctWorksites.Clear();
                     webBrowser.Navigate(linkToMembership);
-
                     break;
-                case WebBrowserTask.GoToAssignments:
+                case WebBrowserTask.ParseSelectedWorksite:
                     // Now we are at HOME link, maybe
 
                     HtmlElementCollection links = webBrowser.Document.GetElementsByTagName("a");
-                    foreach(HtmlElement link in links)
-                        if(link.GetAttribute("className") == "icon-sakai-assignment-grades")
+                    foreach (HtmlElement link in links)
+                        if (link.GetAttribute("className") == "icon-sakai-assignment-grades")
                             linkToAssignments = link.GetAttribute("href");
 
                     if (linkToAssignments == "") throw new Exception("Unable to find Assignments link");
@@ -319,12 +461,13 @@ namespace SakaiParser
                         if (link.GetAttribute("className") == "icon-sakai-siteinfo")
                             linkToSiteEditor = link.GetAttribute("href");
 
-                    if (linkToSiteEditor == "") throw new Exception("Unable to find SiteEditor link");
+                    //                    if (linkToSiteEditor == "") throw new Exception("Unable to find SiteEditor link");
 
                     // If it is okay, we have linkToSiteEditor
-
                     webBrowserTask = WebBrowserTask.Idle;
-
+                    WorksiteSelectedProvider();
+                    break;
+                case WebBrowserTask.GoToAssignments:
                     //////////////////////////////////////////////////////////////////////////////////
                     /*webBrowserTask = WebBrowserTask.ParseAssignments;
                     webBrowser.Navigate(linkToAssignments);*/
@@ -332,14 +475,14 @@ namespace SakaiParser
 
                     break;
                 case WebBrowserTask.ParseAssignments:
-
+                    // To fix
                     HtmlElementCollection assignmentsTable = webBrowser.Document.Window.Frames[1].Document.Forms["listAssignmentsForm"].Document.GetElementsByTagName("table");
-                    foreach(HtmlElement table in assignmentsTable)
+                    foreach (HtmlElement table in assignmentsTable)
                     {
-                        if(table.GetAttribute("className") == "listHier lines nolines")
+                        if (table.GetAttribute("className") == "listHier lines nolines")
                         {
                             HtmlElementCollection trs = table.GetElementsByTagName("tr");
-                            foreach(HtmlElement tr in trs)
+                            foreach (HtmlElement tr in trs)
                             {
                                 HtmlElementCollection tds = tr.GetElementsByTagName("td");
 
@@ -351,9 +494,9 @@ namespace SakaiParser
                                 string innew = "";
                                 string scale = "";
 
-                                foreach(HtmlElement td in tds)
+                                foreach (HtmlElement td in tds)
                                 {
-                                    if(td.GetAttribute("headers") == "title")
+                                    if (td.GetAttribute("headers") == "title")
                                     {
                                         HtmlElement link = td.GetElementsByTagName("a")[0];
                                         title = link.InnerText.Trim();
@@ -372,19 +515,24 @@ namespace SakaiParser
                                     }
                                     if (td.GetAttribute("headers") == "num_submissions")
                                     {
-                                        HtmlElement link = td.GetElementsByTagName("a")[0];
-                                        string outerHtml = link.OuterHtml;
-                                        MatchCollection mathes = Regex.Matches(outerHtml, "window.location\\s*=\\s*('|\")(.*?)('|\")", RegexOptions.IgnoreCase);
-                                        url =  mathes[0].Groups[2].Value;
+                                        HtmlElementCollection linksCount = td.GetElementsByTagName("a");
+                                        if (linksCount.Count > 0)
+                                        {
+                                            HtmlElement link = linksCount[0];
+                                            string outerHtml = link.OuterHtml;
+                                            MatchCollection mathes = Regex.Matches(outerHtml,
+                                                "window.location\\s*=\\s*('|\")(.*?)('|\")", RegexOptions.IgnoreCase);
+                                            url = mathes[0].Groups[2].Value;
 
-                                        innew = td.InnerText;
+                                            innew = td.InnerText;
+                                        }
                                     }
                                     if (td.GetAttribute("headers") == "maxgrade")
                                     {
                                         scale = td.InnerText;
                                     }
                                 }
-                                if(title != "" && status != "" && open != "" && url != "" && due != "" && innew != "" && scale != "")
+                                if (title != "" && status != "" && open != "" && url != "" && due != "" && innew != "" && scale != "")
                                     dctAssignmentItems.Add(title, new Assignment(title, url, status, open, due, innew, scale));
                             }
                         }
@@ -392,13 +540,15 @@ namespace SakaiParser
                     // Assignments are supposed to be parsed
                     assignmentsParsed = true;
                     webBrowserTask = WebBrowserTask.Idle;
+                    AssignmentItemsReadyProvider();
                     break;
-                    // We have all assignments. Go to LoadStudents
+                // We have all assignments. Go to LoadStudents
 
                 case WebBrowserTask.ReloadStudents:
 
                     ParseLoadingStudents(indexOfProcessingAssignment, false);
                     webBrowserTask = WebBrowserTask.Idle;
+                    StudentsInformationReadyProvider();
                     break;
                 case WebBrowserTask.LoadStudents:
 
@@ -463,7 +613,7 @@ namespace SakaiParser
                     {
                         indexOfProcessingAssignment++;
                         indexOfProcessingStudent = 0;
-                        if(indexOfProcessingAssignment >= dctAssignmentItems.Count)
+                        if (indexOfProcessingAssignment >= dctAssignmentItems.Count)
                         {
                             webBrowserTask = WebBrowserTask.Idle; // We are done with attachments loading. Lets have a rest
                             break;
@@ -478,11 +628,11 @@ namespace SakaiParser
                         webBrowser.Document.Window.Frames[1].Navigate(dctAssignmentItems.ElementAt(indexOfProcessingAssignment).Value.StudentInfosDictionary.ElementAt(indexOfProcessingStudent).Value.GradeLink);
                     }
                     else
-                    if (attachmentPresent == false)
-                    {
-                        confidentLoad = true; // Bypass call. Don't know whether it is necessary, but let it be
-                        webBrowser_DocumentCompleted(webBrowser, e);
-                    }
+                        if (attachmentPresent == false)
+                        {
+                            confidentLoad = true; // Bypass call. Don't know whether it is necessary, but let it be
+                            webBrowser_DocumentCompleted(webBrowser, e);
+                        }
 
                     break;
                 case WebBrowserTask.OpenManageGroupsSection:
@@ -520,79 +670,79 @@ namespace SakaiParser
                     switch (groupSectionTask)
                     {
                         case GroupEditorSectionTask.CreateNewGroup:
-                        {
-                            linkToCreateNewGroupSection = "";
-
-                            HtmlElementCollection liElementCollection =
-                                webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("li");
-                            foreach (
-                                HtmlElement htmlElement in
-                                    liElementCollection.Cast<HtmlElement>()
-                                        .Where(
-                                            htmlElement => htmlElement.GetAttribute("className") == "firstToolBarItem"))
                             {
-                                if (htmlElement.InnerHtml.Contains("GroupEdit") &&
-                                    htmlElement.InnerHtml.Contains("item_control"))
+                                linkToCreateNewGroupSection = "";
+
+                                HtmlElementCollection liElementCollection =
+                                    webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("li");
+                                foreach (
+                                    HtmlElement htmlElement in
+                                        liElementCollection.Cast<HtmlElement>()
+                                            .Where(
+                                                htmlElement => htmlElement.GetAttribute("className") == "firstToolBarItem"))
                                 {
-                                    MatchCollection matchCollection = Regex.Matches(htmlElement.InnerHtml,
-                                        "<[a|A].*href\\s*=\\s*[\"|'](?<link>.*)[\"|']\\s*>");
-                                    linkToCreateNewGroupSection = matchCollection[0].Groups["link"].Value;
-                                }
-                            }
-
-                            if (linkToCreateNewGroupSection == "")
-                                throw new Exception("Link to Create New Group is not found.");
-
-                            confidentLoad = true;
-                            // The Frame URL of doesn't match Browser URL, beacuse Browser URL has nothing to do with frame.
-                            webBrowser.Document.Window.Frames[1].Navigate(linkToCreateNewGroupSection);
-
-                            // Browser is navigated to linkToCreateNewGroupSection
-                            // Now lets add new group. 
-
-                            webBrowserTask = WebBrowserTask.AddNewGroup;
-
-                            break;
-                        }
-                        case GroupEditorSectionTask.DeleteExistingGroup:
-                        {
-
-                            webBrowserTask = WebBrowserTask.Idle;
-
-                            HtmlElementCollection tablesCollection = webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("table");
-                            foreach (HtmlElement element in tablesCollection)
-                            {
-                                if (element.GetAttribute("className").Contains("listHier") ||
-                                    element.GetAttribute("className").Contains("lines") || 
-                                    element.GetAttribute("className").Contains("nolines") ||
-                                    element.GetAttribute("className").Contains("centerLines"))
-                                {
-                                    HtmlElementCollection trsCollection = element.GetElementsByTagName("tr");
-                                    foreach (HtmlElement trElement in trsCollection)
+                                    if (htmlElement.InnerHtml.Contains("GroupEdit") &&
+                                        htmlElement.InnerHtml.Contains("item_control"))
                                     {
-                                        if (trElement.InnerText.Contains(deletingGroupName))
+                                        MatchCollection matchCollection = Regex.Matches(htmlElement.InnerHtml,
+                                            "<[a|A].*href\\s*=\\s*[\"|'](?<link>.*)[\"|']\\s*>");
+                                        linkToCreateNewGroupSection = matchCollection[0].Groups["link"].Value;
+                                    }
+                                }
+
+                                if (linkToCreateNewGroupSection == "")
+                                    throw new Exception("Link to Create New Group is not found.");
+
+                                confidentLoad = true;
+                                // The Frame URL of doesn't match Browser URL, beacuse Browser URL has nothing to do with frame.
+                                webBrowser.Document.Window.Frames[1].Navigate(linkToCreateNewGroupSection);
+
+                                // Browser is navigated to linkToCreateNewGroupSection
+                                // Now lets add new group. 
+
+                                webBrowserTask = WebBrowserTask.AddNewGroup;
+
+                                break;
+                            }
+                        case GroupEditorSectionTask.DeleteExistingGroup:
+                            {
+
+                                webBrowserTask = WebBrowserTask.Idle;
+
+                                HtmlElementCollection tablesCollection = webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("table");
+                                foreach (HtmlElement element in tablesCollection)
+                                {
+                                    if (element.GetAttribute("className").Contains("listHier") ||
+                                        element.GetAttribute("className").Contains("lines") ||
+                                        element.GetAttribute("className").Contains("nolines") ||
+                                        element.GetAttribute("className").Contains("centerLines"))
+                                    {
+                                        HtmlElementCollection trsCollection = element.GetElementsByTagName("tr");
+                                        foreach (HtmlElement trElement in trsCollection)
                                         {
-                                            if (trElement.GetElementsByTagName("span")[0].InnerText == deletingGroupName)
+                                            if (trElement.InnerText.Contains(deletingGroupName))
                                             {
-                                                HtmlElement inputToCheck = trElement.GetElementsByTagName("input")[0];
-                                                inputToCheck.InvokeMember("CLICK");
+                                                if (trElement.GetElementsByTagName("span")[0].InnerText == deletingGroupName)
+                                                {
+                                                    HtmlElement inputToCheck = trElement.GetElementsByTagName("input")[0];
+                                                    inputToCheck.InvokeMember("CLICK");
+                                                }
                                             }
                                         }
                                     }
                                 }
+
+                                HtmlElement deleteButtonInputElement = webBrowser.Document.Window.Frames[1].Document.GetElementById("delete-groups");
+                                deleteButtonInputElement.InvokeMember("CLICK");
+
+                                new Thread(() =>
+                                {
+                                    Thread.Sleep(1000);
+                                    Application.OpenForms["Form1"].Invoke(confirmDeletingVoid);
+                                }).Start();
+
+                                break;
                             }
-
-                            HtmlElement deleteButtonInputElement = webBrowser.Document.Window.Frames[1].Document.GetElementById("delete-groups");
-                            deleteButtonInputElement.InvokeMember("CLICK");
-
-                            new Thread(() =>
-                            {
-                                Thread.Sleep(1000);
-                                Application.OpenForms["Form1"].Invoke(confirmDeletingVoid);
-                            }).Start();
-
-                            break;
-                        }
                         case GroupEditorSectionTask.GetGroupList:
                             break;
                         default:
@@ -648,7 +798,7 @@ namespace SakaiParser
 
                 case WebBrowserTask.GradeStudent:
 
-                    webBrowser.Document.Window.Frames[1].Document.GetElementById("grade").SetAttribute("value", studentmark.ToString());
+                    webBrowser.Document.Window.Frames[1].Document.GetElementById("grade").SetAttribute("value", studentmark);
 
                     HtmlElementCollection processBtn = webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("input");
                     foreach (HtmlElement element in processBtn)
@@ -656,93 +806,124 @@ namespace SakaiParser
                         if (element.GetAttribute("name") == "return")
                         {
                             element.InvokeMember("CLICK");
+                            webBrowserTask = WebBrowserTask.Idle;
                             break;
                         }
                     }
+                    webBrowserTask = WebBrowserTask.Idle;
                     break;
-                case WebBrowserTask.RenameStudent:
-                {
-                    HtmlElement inputSearch = webBrowser.Document.Window.Frames[1].Document.GetElementById("search");
-
-                    if(inputSearch == null) throw new NullReferenceException("Input field is NULL.");
-
-                    inputSearch.Document.GetElementById("search").SetAttribute("value", renamingStudentID);
-
-                    HtmlElementCollection framesAs = webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("a");
-
-                    foreach (HtmlElement a in framesAs)
+                case WebBrowserTask.GoToAdministrationWorkspaceUsersTab:
                     {
-                        if (a.GetAttribute("title").Contains("Search"))
+                        HtmlElementCollection hec = webBrowser.Document.GetElementsByTagName("a");
+                        //foreach(String str in from HtmlElement he in hec where he.InnerText.Contains("Users") select he.GetAttribute("href"))
+                        String str = "";
+                        foreach (HtmlElement elem in hec)
                         {
-                            a.InvokeMember("CLICK");
-                            break;
-                        }
-                    }
-
-                    Task asyncTask = new Task(() =>
-                    {
-                        Thread.Sleep(500);
-                    });
-
-                    asyncTask.ContinueWith((a) =>
-                    {
-                        webBrowserTask = WebBrowserTask.ContinueStudentRenaming;
-                        webBrowser_DocumentCompleted(webBrowser, e);
-                        confidentLoad = true;
-
-                    }, TaskScheduler.FromCurrentSynchronizationContext());
-
-                    asyncTask.Start();
-
-                    break;
-                }
-                case WebBrowserTask.ContinueStudentRenaming:
-                {
-                    HtmlElementCollection tds = webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("td");
-
-                    foreach (HtmlElement td in tds)
-                    {
-                        if (td.GetAttribute("headers").Contains("Eid") && td.InnerText.Contains(renamingStudentID))
-                        {
-                            HtmlElementCollection tdAs = td.GetElementsByTagName("a");
-
-                            foreach (HtmlElement a in tdAs)
+                            if (elem.InnerText != null)
                             {
-                                string innerText = a.InnerText.Trim();
-                                if (innerText.Equals(renamingStudentID))
+                                if (elem.InnerText.Contains("Users"))
                                 {
-                                    string href = a.GetAttribute("href");
-
-                                    confidentLoad = true;
-                                    webBrowserTask = WebBrowserTask.SetNewFirstNameAndLastName;
-                                    webBrowser.Document.Window.Frames[1].Navigate(href);
+                                    str = elem.GetAttribute("href");
+                                    break;
                                 }
                             }
-
-
                         }
+                        if (!String.IsNullOrEmpty(str))
+                        {
+                            webBrowserTask = WebBrowserTask.Busy;
+                            webBrowser.Navigate(str);
+                        }
+                        else
+                        {
+                            SPExceptionProvider(SPExceptions.UnableToFindLinkToUsersTab);
+                            return;
+                        }
+                        break;
                     }
-
-                    break;
-                }
-                case WebBrowserTask.SetNewFirstNameAndLastName:
-                {
-                    HtmlElementCollection inputCollection =
-                        webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("input");
-
-                    HtmlElement firstNameInput = webBrowser.Document.Window.Frames[1].Document.GetElementById("first-name");
-                    HtmlElement lastNameInput = webBrowser.Document.Window.Frames[1].Document.GetElementById("last-name");
-
-                    firstNameInput.SetAttribute("value", renamingStudentName);
-                    lastNameInput.SetAttribute("value", renamingStudentLastname);
-
-                    foreach (HtmlElement elem in from HtmlElement he in inputCollection where he.GetAttribute("name").Contains("eventSubmit_doSave") select he)
+                case WebBrowserTask.RenameStudent:
                     {
-                        elem.InvokeMember("CLICK");
-                    }
+                        HtmlElement inputSearch = webBrowser.Document.Window.Frames[1].Document.GetElementById("search");
 
-                    break;
-                }
+                        if (inputSearch == null) throw new NullReferenceException("Input field is NULL.");
+
+                        inputSearch.Document.GetElementById("search").SetAttribute("value", renamingStudentID);
+
+                        HtmlElementCollection framesAs = webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("a");
+
+                        foreach (HtmlElement a in framesAs)
+                        {
+                            if (a.GetAttribute("title").Contains("Search"))
+                            {
+                                a.InvokeMember("CLICK");
+                                break;
+                            }
+                        }
+
+                        Task asyncTask = new Task(() =>
+                        {
+                            Thread.Sleep(500);
+                        });
+
+                        asyncTask.ContinueWith((a) =>
+                        {
+                            webBrowserTask = WebBrowserTask.ContinueStudentRenaming;
+                            confidentLoad = true;
+                            webBrowser_DocumentCompleted(webBrowser, null);
+
+                        }, TaskScheduler.FromCurrentSynchronizationContext());
+
+                        asyncTask.Start();
+
+                        break;
+                    }
+                case WebBrowserTask.ContinueStudentRenaming:
+                    {
+                        HtmlElementCollection tds = webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("td");
+
+                        foreach (HtmlElement td in tds)
+                        {
+                            if (td.GetAttribute("headers").Contains("Eid") && td.InnerText.Contains(renamingStudentID))
+                            {
+                                HtmlElementCollection tdAs = td.GetElementsByTagName("a");
+
+                                foreach (HtmlElement a in tdAs)
+                                {
+                                    string innerText = a.InnerText.Trim();
+                                    if (innerText.Equals(renamingStudentID))
+                                    {
+                                        string href = a.GetAttribute("href");
+
+                                        confidentLoad = true;
+                                        webBrowserTask = WebBrowserTask.SetNewFirstNameAndLastName;
+                                        webBrowser.Document.Window.Frames[1].Navigate(href);
+                                    }
+                                }
+
+
+                            }
+                        }
+
+                        break;
+                    }
+                case WebBrowserTask.SetNewFirstNameAndLastName:
+                    {
+                        HtmlElementCollection inputCollection =
+                            webBrowser.Document.Window.Frames[1].Document.GetElementsByTagName("input");
+
+                        HtmlElement firstNameInput = webBrowser.Document.Window.Frames[1].Document.GetElementById("first-name");
+                        HtmlElement lastNameInput = webBrowser.Document.Window.Frames[1].Document.GetElementById("last-name");
+
+                        firstNameInput.SetAttribute("value", renamingStudentName);
+                        lastNameInput.SetAttribute("value", renamingStudentLastname);
+
+                        foreach (HtmlElement elem in from HtmlElement he in inputCollection where he.GetAttribute("name").Contains("eventSubmit_doSave") select he)
+                        {
+                            elem.InvokeMember("CLICK");
+                        }
+
+                        webBrowserTask = WebBrowserTask.Idle;
+                        break;
+                    }
                 case WebBrowserTask.Idle:
                     break;
                 default:
@@ -881,8 +1062,16 @@ namespace SakaiParser
                         {
                             if (studentID != "" && studentName != "")
                             {
-                                dctAssignmentItems.ElementAt(assignmentIndex).Value.StudentInfosDictionary.Add(studentID,
-                                    new StudentInfo(studentName, studentID, submitted, status, grade, released, gradeLink, attached));
+                                Dictionary<string, StudentInfo> sid = dctAssignmentItems.ElementAt(assignmentIndex).Value.StudentInfosDictionary;
+                                StudentInfo si = new StudentInfo(studentName, studentID, submitted, status, grade, released, gradeLink, attached);
+                                if (sid.ContainsKey(studentID))
+                                {
+                                    sid[studentID] = si;
+                                }
+                                else
+                                {
+                                    sid.Add(studentID, si);
+                                }
 
                             }
                         }
@@ -937,12 +1126,18 @@ namespace SakaiParser
             return studID;
         }
 
-        public void ParseStudentsAsync()
+        /// <summary>
+        /// Parse students from assignment
+        /// </summary>
+        public void ParseStudents()
         {
-            ParseStudentsAsync(dctAssignmentItems.Keys.ToArray()[0]);
+            ParseStudents(dctAssignmentItems.Keys.ToArray()[0]);
         }
-
-        public void ParseStudentsAsync(String assignment)
+        /// <summary>
+        /// Parse students from selected assignment
+        /// </summary>
+        /// <param name="assignment"></param>
+        public void ParseStudents(String assignment)
         {
             indexOfProcessingAssignment = -1;
             String[] assignments = dctAssignmentItems.Keys.ToArray();
@@ -1003,7 +1198,7 @@ namespace SakaiParser
             return dctAssignmentItems.Values.Select(x => x.Title).ToArray();
         }
 
-        public void GradeStudent(string assignmentName, string studentID, int mark)
+        public void GradeStudent(string assignmentName, string studentID, String mark)
         {
             Assignment assignment = dctAssignmentItems[assignmentName];
             studentmark = mark;
@@ -1021,22 +1216,34 @@ namespace SakaiParser
 
         }
 
+        /// <summary>
+        /// Opens Users tab. Web browser should be navigated to Administration Workspace
+        /// </summary>
+        public void OpenAdministrationWorkspaceUsersTab()
+        {
+            webBrowserTask = WebBrowserTask.GoToAdministrationWorkspaceUsersTab;
+            confidentLoad = true;
+            webBrowser_DocumentCompleted(webBrowser, null);
+        }
+
+        /// <summary>
+        /// Renames User. Web browser should be navigated to the User tab in Administration Workspace
+        /// </summary>
         public void RenameUser(string id, string firstName, string lastName)
         {
-            // Web browser should be navigated to the User tab in Adm. Workspace
-
             renamingStudentLastname = lastName;
             renamingStudentName = firstName;
             renamingStudentID = id;
 
             webBrowserTask = WebBrowserTask.RenameStudent;
-            webBrowser.Navigate("URL");
+            confidentLoad = true;
+            webBrowser_DocumentCompleted(webBrowser, null);
         }
 
         /// <summary>
         /// Starts asynchronous assignment items parsing process
         /// </summary>
-        public void ParseAssignmentItemsAsync()
+        public void ParseAssignmentItems()
         {
             webBrowserTask = WebBrowserTask.ParseAssignments;
             webBrowser.Navigate(linkToAssignments);
@@ -1058,7 +1265,7 @@ namespace SakaiParser
             loginFrame.Document.GetElementById("eid").SetAttribute("value", UserName);
             loginFrame.Document.GetElementById("pw").SetAttribute("value", Password);
             loginFrame.Navigate("javascript:document.forms[0].submit()");
-            webBrowserTask = WebBrowserTask.GetMembershipLink;
+            ReadWorksitesAsync();
         }
     }
 }
